@@ -23,9 +23,20 @@ refusals matter as much as the translations: a wrong translation is a silent
 wrong number on another engine.
 """
 
+import warnings
+
 import pytest
 
 from ossie_microsoft._dax_to_sql import translate_measure
+from ossie_microsoft.semantic_model_to_ossie import build_ossie_document
+
+
+def _dialects(metric):
+    return {d["dialect"]: d["expression"] for d in metric["expression"]["dialects"]}
+
+
+def _metric(document, name):
+    return next(m for m in document["metrics"] if m["name"] == name)
 
 
 def resolve(table, column):
@@ -128,3 +139,39 @@ def test_nested_call_does_not_parse_as_single_aggregate():
     sql, reason = translate_measure("SUM(ROUND('Sales'[Amount], 2))", resolve)
     assert sql is None
     assert reason
+
+
+# --- Integration: the opt-in flag wired through build_ossie_document ---------
+
+
+def _build(bim, translate_dax):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return build_ossie_document(bim, translate_dax=translate_dax)
+
+
+def test_default_keeps_every_measure_as_dax_only(bim):
+    document = _build(bim, translate_dax=False)
+    for metric in document["metrics"]:
+        assert list(_dialects(metric)) == ["DAX"], metric["name"]
+
+
+def test_flag_translates_a_single_column_aggregate_and_keeps_dax_fallback(bim):
+    document = _build(bim, translate_dax=True)
+    dialects = _dialects(_metric(document, "Total Sales"))
+    # OSSIE_SQL_2026 is added as the portable rendering ...
+    assert dialects["OSSIE_SQL_2026"] == "SUM(Sales.Amount)"
+    # ... and the original DAX is preserved as a fallback, so nothing is lost.
+    assert dialects["DAX"] == "SUM ( Sales[Amount] )"
+
+
+def test_flag_refuses_countrows_and_leaves_it_as_dax(bim):
+    document = _build(bim, translate_dax=True)
+    dialects = _dialects(_metric(document, "Order Count"))
+    assert list(dialects) == ["DAX"]
+
+
+def test_flag_is_order_preserving_portable_first(bim):
+    document = _build(bim, translate_dax=True)
+    first = _metric(document, "Total Sales")["expression"]["dialects"][0]
+    assert first["dialect"] == "OSSIE_SQL_2026"
