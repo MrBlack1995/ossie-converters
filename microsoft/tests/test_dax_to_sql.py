@@ -498,6 +498,101 @@ def test_logic_sql_parses(dax):
     assert reason is None, reason
     sqlglot.parse_one(sql)
 
+
+# --- Math (PR3b): translated only for never-BLANK arguments ------------------
+
+
+@pytest.mark.parametrize(
+    "dax, expected",
+    [
+        ("ABS(COALESCE([Total Sales], 0))", "ABS(COALESCE(SUM(Sales.Amount), 0))"),
+        ("SIGN(-3)", "SIGN(-3)"),
+        ("SQRT(16)", "SQRT(16)"),
+        ("POWER(2, 3) + 1", "POWER(2, 3) + 1"),
+        ("EXP(0)", "EXP(0)"),
+        ("LN(1)", "LN(1)"),
+        # DAX LOG(number, base) defaults to base 10; the spec writes LOG(base, x).
+        ("LOG(100)", "LOG10(100)"),
+        ("LOG(8, 2)", "LOG(2, 8)"),
+        ("LOG10(1000)", "LOG10(1000)"),
+        ("INT(-8.9)", "FLOOR(-8.9)"),
+        ("TRUNC(-8.9)", "TRUNC(-8.9, 0)"),
+        ("ROUNDDOWN(3.14159, 2)", "TRUNC(3.14159, 2)"),
+        ("QUOTIENT(-10, 3)", "TRUNC(CAST(-10 AS DOUBLE) / 3, 0)"),
+        ("MOD(-3, 2)", "-3 - 2 * FLOOR(CAST(-3 AS DOUBLE) / 2)"),
+        ("PI()", "PI()"),
+        ("DEGREES(PI())", "DEGREES(PI())"),
+        ("VAR s = COALESCE([Total Sales], 0) RETURN SQRT(s)",
+         "SQRT(COALESCE(SUM(Sales.Amount), 0))"),
+    ],
+)
+def test_translates_math(dax, expected):
+    sql, reason = translate_measure(dax, resolve, LOGIC)
+    assert reason is None, reason
+    assert sql == expected
+
+
+@pytest.mark.parametrize(
+    "dax, fragment",
+    [
+        ("ABS([Total Sales])", "may be BLANK"),
+        ("ROUND(2.5, 0)", "ties half away from zero"),
+        ("ROUNDUP(2.1, 0)", "ROUNDUP"),
+        ("CEILING(2.1, 1)", "significance"),
+        ("FLOOR(2.1, 1)", "significance"),
+        ("POWER(2)", "POWER takes 2 argument(s)"),
+        ("ABS(TRUE())", "boolean"),
+        ("MROUND(7, 2)", "not translated yet"),
+    ],
+)
+def test_math_refusals_carry_a_reason(dax, fragment):
+    sql, reason = translate_measure(dax, resolve, LOGIC)
+    assert sql is None
+    assert fragment in reason
+
+
+def _evaluate_math(sql):
+    """Run a constant math expression in SQLite. SQLite has no two-argument TRUNC, so the
+    spec's TRUNC(x, d) (truncate toward zero to d decimals) is registered for the test."""
+    import math
+    import sqlite3
+
+    def trunc(x, d):
+        factor = 10 ** d
+        return math.trunc(x * factor) / factor
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.create_function("TRUNC", 2, trunc)
+        return connection.execute(f"SELECT {sql}").fetchone()[0]
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "dax, dax_result",
+    [
+        # MOD takes the sign of the divisor (Microsoft's examples: MOD(3,2)=1, MOD(-3,-2)=-1).
+        ("MOD(3, 2)", 1),
+        ("MOD(-3, -2)", -1),
+        ("MOD(-3, 2)", 1),
+        ("MOD(3, -2)", -1),
+        ("QUOTIENT(-10, 3)", -3),
+        ("QUOTIENT(10, 3)", 3),
+        ("INT(-8.9)", -9),
+        ("TRUNC(-8.9)", -8),
+        ("ROUNDDOWN(3.14159, 2)", 3.14),
+        ("LOG(100)", 2),
+        ("LOG(8, 2)", 3),
+        ("POWER(2, 3)", 8),
+        ("ABS(-2.5)", 2.5),
+    ],
+)
+def test_math_sql_matches_dax_results(dax, dax_result):
+    sql, reason = translate_measure(dax, resolve, LOGIC)
+    assert reason is None, reason
+    assert _evaluate_math(sql) == pytest.approx(dax_result)
+
 # --- Robustness: size and depth limits (review on #27) -----------------------
 
 

@@ -82,6 +82,16 @@ and logic and conditionals, again matching DAX's documented BLANK rules:
 * ``COALESCE``, ``BLANK()``, ``ISBLANK(x)`` (``x IS NULL``), ``TRUE`` / ``FALSE``,
   ``AND`` / ``OR`` / ``NOT`` and ``&&`` / ``||``, and text literals as results.
 
+and math functions, but only for arguments that can never be BLANK (a literal,
+``COALESCE(x, 0)``, a variable holding one), because Microsoft does not document what
+they return for BLANK: ``ABS``, ``SIGN``, ``SQRT``, ``POWER``, ``EXP``, ``LN``, ``LOG10``,
+``PI``, trigonometry, ``DEGREES`` / ``RADIANS``; ``LOG(number, base)`` -> ``LOG(base,
+number)`` (base 10 when omitted, ``LOG10``); ``INT`` -> ``FLOOR``; ``TRUNC`` and ``ROUNDDOWN``
+-> ``TRUNC(x, d)``; ``QUOTIENT`` -> ``TRUNC(CAST(n AS DOUBLE) / d, 0)``; and ``MOD``, whose
+result takes the sign of the divisor, -> ``n - d * FLOOR(CAST(n AS DOUBLE) / d)`` (the
+documented identity; SQL ``MOD`` takes the sign of the dividend). ``MOD`` and ``QUOTIENT``
+force true division so an engine that truncates integer division gives the same result.
+
 What is refused (and why, so the refusal is defensible)
 -------------------------------------------------------
 * ``COUNT`` and ``DISTINCTCOUNT``. DAX ``COUNT`` documents ``TRUE``/``FALSE``
@@ -102,6 +112,9 @@ What is refused (and why, so the refusal is defensible)
   (``TRUE AND BLANK`` is FALSE, ``BLANK OR BLANK`` is BLANK) is not SQL's NULL logic.
 * Comparisons of text, and results that mix types (text in one branch, a number in
   another): later tiers.
+* ``ROUND``: DAX breaks ties half away from zero, and the spec's ``ROUND`` does not say how
+  ties are broken. ``CEILING`` / ``FLOOR`` (rounding to a multiple of a significance) and
+  ``ROUNDUP``: later tiers. A math function over a value that may be BLANK.
 * Every other function, with the reason ``_dax_catalog`` records for it (a later
   tier of this converter, a feature the specification does not define yet, or no
   portable form at all).
@@ -159,7 +172,11 @@ _SEMANTIC_MISMATCH = {
 }
 
 #: Every DAX function this module emits a translation for.
-TRANSLATED_FUNCTIONS = frozenset(_AGGREGATES) | {
+TRANSLATED_FUNCTIONS = frozenset(_AGGREGATES) | frozenset(
+    ("ABS", "SIGN", "SQRT", "POWER", "EXP", "LN", "LOG", "LOG10", "INT", "TRUNC",
+     "ROUNDDOWN", "QUOTIENT", "MOD", "PI", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN",
+     "DEGREES", "RADIANS")
+) | {
     "DIVIDE", "IF", "IF.EAGER", "SWITCH", "COALESCE", "BLANK", "ISBLANK",
     "TRUE", "FALSE", "AND", "OR", "NOT",
 }
@@ -276,6 +293,10 @@ class _Translator:
             return self.divide(node, variables)
         if node.name in _LOGIC_FUNCTIONS:
             return getattr(self, _LOGIC_FUNCTIONS[node.name])(node, variables)
+        if node.name in _MATH_FUNCTIONS:
+            return self.math(node, variables)
+        if node.name in _MATH_REFUSED:
+            raise _RefusedError(_MATH_REFUSED[node.name])
         if node.name in _SEMANTIC_MISMATCH:
             raise _RefusedError(_SEMANTIC_MISMATCH[node.name])
         raise _RefusedError(refusal_reason(node.name))
@@ -487,6 +508,28 @@ class _Translator:
         nullable = otherwise is None or any(r.nullable for r in results)
         return _Sql(text, _ATOM, nullable, kind)
 
+    # --- math ------------------------------------------------------------------
+
+    def math(self, node, variables):
+        """Translate a math function whose arguments can never be BLANK.
+
+        Microsoft does not document what the math functions return for a BLANK argument,
+        so a translation for a possibly-BLANK argument would be a guess. With a never-BLANK
+        argument (a literal, COALESCE(..., 0), a variable holding one) the result is plain
+        math and the translation is exact.
+        """
+        arities, render = _MATH_FUNCTIONS[node.name]
+        if len(node.args) not in arities:
+            raise _RefusedError(f"{node.name} takes {_arity_text(arities)} argument(s)")
+        args = [self.number(arg, variables) for arg in node.args]
+        if any(arg.nullable for arg in args):
+            raise _RefusedError(
+                f"{node.name} of a value that may be BLANK: its BLANK behaviour is not "
+                "documented (wrap the argument in COALESCE(x, 0) to translate it)"
+            )
+        text, precedence = render([arg.text for arg in args], args)
+        return _Sql(text, precedence, False)
+
     # --- composition ------------------------------------------------------------
 
     def measure_reference(self, name):
@@ -547,6 +590,80 @@ _LOGIC_FUNCTIONS = {
     "OR": "and_or",
     "NOT": "not_",
 }
+
+
+def _call(name):
+    """Render a same-named SQL function call."""
+    return lambda texts, args: (f"{name}({', '.join(texts)})", _ATOM)
+
+
+def _mod(texts, args):
+    # DAX MOD takes the sign of the divisor and is documented as n - d * INT(n / d);
+    # SQL MOD / % takes the sign of the dividend, so the identity is emitted instead.
+    # The division is forced to be true division (an engine may truncate n / d for
+    # integers, which would change the result).
+    n, d = texts
+    divisor = _wrap(args[1], _MUL, strict=True)
+    return f"{_wrap(args[0], _ADD)} - {divisor} * FLOOR(CAST({n} AS DOUBLE) / {divisor})", _ADD
+
+
+def _trunc(texts, args):
+    digits = texts[1] if len(texts) == 2 else "0"
+    return f"TRUNC({texts[0]}, {digits})", _ATOM
+
+
+def _quotient(texts, args):
+    # QUOTIENT returns the integer portion of the division, truncated toward zero; the
+    # division is forced to be true division, as for MOD.
+    divisor = _wrap(args[1], _MUL, strict=True)
+    return f"TRUNC(CAST({texts[0]} AS DOUBLE) / {divisor}, 0)", _ATOM
+
+
+def _log(texts, args):
+    # DAX LOG(number, base) defaults to base 10; the spec writes LOG(base, x).
+    if len(texts) == 1:
+        return f"LOG10({texts[0]})", _ATOM
+    return f"LOG({texts[1]}, {texts[0]})", _ATOM
+
+
+#: Math functions translated for never-BLANK arguments: name -> (arities, renderer).
+_MATH_FUNCTIONS = {
+    "ABS": ({1}, _call("ABS")),
+    "SIGN": ({1}, _call("SIGN")),
+    "SQRT": ({1}, _call("SQRT")),
+    "POWER": ({2}, _call("POWER")),
+    "EXP": ({1}, _call("EXP")),
+    "LN": ({1}, _call("LN")),
+    "LOG": ({1, 2}, _log),
+    "LOG10": ({1}, _call("LOG10")),
+    "INT": ({1}, _call("FLOOR")),  # INT rounds down to the nearest integer
+    "TRUNC": ({1, 2}, _trunc),
+    "ROUNDDOWN": ({2}, _trunc),  # toward zero, like TRUNC
+    "QUOTIENT": ({2}, _quotient),
+    "MOD": ({2}, _mod),
+    "PI": ({0}, _call("PI")),
+    "SIN": ({1}, _call("SIN")),
+    "COS": ({1}, _call("COS")),
+    "TAN": ({1}, _call("TAN")),
+    "ASIN": ({1}, _call("ASIN")),
+    "ACOS": ({1}, _call("ACOS")),
+    "ATAN": ({1}, _call("ATAN")),
+    "DEGREES": ({1}, _call("DEGREES")),
+    "RADIANS": ({1}, _call("RADIANS")),
+}
+
+#: Math functions refused for a semantic reason more specific than "not yet".
+_MATH_REFUSED = {
+    "ROUND": "DAX ROUND breaks ties half away from zero; the spec's ROUND does not say how "
+    "ties are broken, so the result could differ on a tie",
+    "ROUNDUP": "ROUNDUP (away from zero) is a later tier",
+    "CEILING": "DAX CEILING rounds to a multiple of a significance, unlike SQL CEIL",
+    "FLOOR": "DAX FLOOR rounds to a multiple of a significance, unlike SQL FLOOR",
+}
+
+
+def _arity_text(arities):
+    return " or ".join(str(n) for n in sorted(arities))
 
 
 def _is_true(node):
