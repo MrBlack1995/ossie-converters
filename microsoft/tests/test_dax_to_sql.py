@@ -380,10 +380,10 @@ def test_flag_expands_measure_references_across_the_model(bim):
     assert list(_dialects(_metric(document, "Per Order"))) == ["DAX"]
 
 
-def test_a_literal_that_is_not_a_number_is_a_later_tier():
-    sql, reason = translate_measure('"not a number"', resolve, MEASURES)
-    assert sql is None
-    assert "string expressions are a later tier" in reason
+def test_a_text_literal_is_translated_with_quotes_escaped():
+    sql, reason = translate_measure('"it\'s ""quoted"""', resolve, MEASURES)
+    assert reason is None, reason
+    assert sql == "'it''s \"quoted\"'"
 
 
 def test_a_referenced_measure_that_does_not_parse_is_refused():
@@ -392,6 +392,111 @@ def test_a_referenced_measure_that_does_not_parse_is_refused():
     assert sql is None
     assert "referenced measure [Broken] could not be parsed" in reason
 
+
+# --- Logic and conditionals (PR3) --------------------------------------------
+
+LOGIC = dict(MEASURES, Margin="[Total Sales] - [Customers]")
+
+
+@pytest.mark.parametrize(
+    "dax, expected",
+    [
+        ("BLANK()", "NULL"),
+        ("TRUE()", "TRUE"),
+        ("COALESCE([Total Sales], 0)", "COALESCE(SUM(Sales.Amount), 0)"),
+        # Comparisons coerce a BLANK number to 0, as DAX does.
+        ("IF([Total Sales] > 1000, 1, 0)",
+         "CASE WHEN COALESCE(SUM(Sales.Amount), 0) > 1000 THEN 1 ELSE 0 END"),
+        # IF without a value if false returns BLANK.
+        ('IF([Total Sales] > 1000, "High")',
+         "CASE WHEN COALESCE(SUM(Sales.Amount), 0) > 1000 THEN 'High' END"),
+        # A numeric test is TRUE when non-zero; BLANK is FALSE.
+        ("IF([Total Sales], 1, 0)",
+         "CASE WHEN COALESCE(SUM(Sales.Amount), 0) <> 0 THEN 1 ELSE 0 END"),
+        ("IF(ISBLANK([Total Sales]), 0, [Total Sales])",
+         "CASE WHEN SUM(Sales.Amount) IS NULL THEN 0 ELSE SUM(Sales.Amount) END"),
+        ("IF.EAGER([Total Sales] = 0, BLANK(), 1)",
+         "CASE WHEN COALESCE(SUM(Sales.Amount), 0) = 0 THEN NULL ELSE 1 END"),
+        ('SWITCH(TRUE, [Total Sales] > 100, "A", [Total Sales] > 10, "B", "C")',
+         "CASE WHEN COALESCE(SUM(Sales.Amount), 0) > 100 THEN 'A' "
+         "WHEN COALESCE(SUM(Sales.Amount), 0) > 10 THEN 'B' ELSE 'C' END"),
+        ("SWITCH(TRUE(), [Customers] >= 5, 1)",
+         "CASE WHEN COALESCE(COUNT(Sales.Customer), 0) >= 5 THEN 1 END"),
+        ("[Total Sales] > 0 && [Customers] > 0",
+         "COALESCE(SUM(Sales.Amount), 0) > 0 AND COALESCE(COUNT(Sales.Customer), 0) > 0"),
+        ("OR([Total Sales] > 0, NOT([Customers] > 0))",
+         "COALESCE(SUM(Sales.Amount), 0) > 0 OR NOT COALESCE(COUNT(Sales.Customer), 0) > 0"),
+        ("[Total Sales] == BLANK()", "SUM(Sales.Amount) IS NOT DISTINCT FROM NULL"),
+        ("IF(TRUE, 1, 0)", "CASE WHEN TRUE THEN 1 ELSE 0 END"),
+        ("NOT [Total Sales] > 0", "NOT COALESCE(SUM(Sales.Amount), 0) > 0"),
+    ],
+)
+def test_translates_logic(dax, expected):
+    sql, reason = translate_measure(dax, resolve, LOGIC)
+    assert reason is None, reason
+    assert sql == expected
+
+
+@pytest.mark.parametrize(
+    "dax, fragment",
+    [
+        ('SWITCH([Customers], 1, "one", "many")', "SWITCH matching a value"),
+        ('IF([Total Sales] > 0, "High", 0)', "results of different types"),
+        ('"a" = "b"', "comparison on a text value"),
+        ("ISBLANK([Total Sales]) + 1", "arithmetic or comparison on a boolean"),
+        ("IF(ISBLANK([Total Sales]), TRUE(), BLANK()) && TRUE()", "logical operand"),
+        ("IF('Sales'[Amount] > 0, 1, 0)", "bare column reference"),
+        ("COALESCE([Total Sales])", "at least two arguments"),
+        ('IF("yes", 1, 0)', "is not a condition"),
+        ("NOT(TRUE(), FALSE())", "NOT takes exactly one argument"),
+        ("ISBLANK()", "ISBLANK takes exactly one argument"),
+        ("ISBLANK(TRUE())", "ISBLANK of a boolean"),
+        ("SWITCH(TRUE, 1)", "needs at least one condition and result"),
+        ("{1, 2}", "later tier"),
+    ],
+)
+def test_logic_refusals_carry_a_reason(dax, fragment):
+    sql, reason = translate_measure(dax, resolve, LOGIC)
+    assert sql is None
+    assert fragment in reason
+
+
+@pytest.mark.parametrize(
+    "dax, rows, dax_result",
+    [
+        # BLANK > 0 is FALSE in DAX (BLANK compares as 0), so the else branch.
+        ("IF(SUM('Sales'[Amount]) > 0, 1, 0)", [], 0),
+        # BLANK = 0 is TRUE in DAX.
+        ("IF(SUM('Sales'[Amount]) = 0, 1, 0)", [], 1),
+        # BLANK == 0 is FALSE (strict), BLANK == BLANK is TRUE.
+        ("IF(SUM('Sales'[Amount]) == 0, 1, 0)", [], 0),
+        ("IF(SUM('Sales'[Amount]) == BLANK(), 1, 0)", [], 1),
+        # IF without a value if false returns BLANK.
+        ("IF(SUM('Sales'[Amount]) > 0, 1)", [], None),
+        # A BLANK numeric test is FALSE.
+        ("IF(SUM('Sales'[Amount]), 1, 0)", [], 0),
+        ("IF(SUM('Sales'[Amount]), 1, 0)", [(5.0, "a")], 1),
+        ("COALESCE(SUM('Sales'[Amount]), 7)", [], 7),
+        ("SWITCH(TRUE, SUM('Sales'[Amount]) > 10, 2, SUM('Sales'[Amount]) > 1, 1, 0)",
+         [(5.0, "a")], 1),
+    ],
+)
+def test_logic_sql_matches_dax_blank_semantics(dax, rows, dax_result):
+    sql, reason = translate_measure(dax, resolve, LOGIC)
+    assert reason is None, reason
+    assert _evaluate(sql, rows) == dax_result
+
+
+@pytest.mark.parametrize("dax", [
+    'SWITCH(TRUE, [Total Sales] > 100, "A", "C")',
+    "[Total Sales] > 0 && NOT([Customers] = 0)",
+    "[Total Sales] == BLANK()",
+])
+def test_logic_sql_parses(dax):
+    sqlglot = pytest.importorskip("sqlglot")
+    sql, reason = translate_measure(dax, resolve, LOGIC)
+    assert reason is None, reason
+    sqlglot.parse_one(sql)
 
 # --- Robustness: size and depth limits (review on #27) -----------------------
 
