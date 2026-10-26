@@ -840,6 +840,28 @@ def test_the_portable_sql_form_wins_over_an_ossie_sql_dialect_entry():
     assert _metric_dax_for(expression) == "SUM('T'[C])"
 
 
+def test_the_portable_sql_form_wins_over_a_stale_ansi_sql_entry():
+    # The spec's examples carry `sql` plus an ANSI_SQL "default" copy; if only `sql`
+    # was edited, exporting the ANSI text would silently use the stale expression.
+    semantic_model = _minimal(
+        metrics=[
+            {
+                "name": "M",
+                "expression": {
+                    "sql": "SUM(c)",
+                    "dialects": [{"dialect": "ANSI_SQL", "expression": "MIN(c)"}],
+                },
+            }
+        ]
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bim = _convert(semantic_model)
+    measure = _table(bim, "T")["measures"][0]
+    assert measure["expression"] == "SUM('T'[C])"
+    assert _annotation(measure, "OssieExpressionDialect") == "OSSIE_SQL_2026"
+
+
 def test_a_dax_variant_is_still_preferred_over_the_portable_sql_form():
     expression = {
         "sql": "SUM(c)",
@@ -967,6 +989,26 @@ def test_dax_is_preferred_over_ossie_sql():
     assert "annotations" not in measure
 
 
+def _core_schema():
+    repo_root = Path(__file__).resolve().parents[2] / "ossie"
+    return json.loads(
+        (repo_root / "core-spec" / "ossie-schema.json").read_text(encoding="utf-8")
+    )
+
+
+def test_the_tpcds_example_in_the_sql_form_is_valid_against_the_spec():
+    schema = _core_schema()
+    if "sql" not in schema["$defs"]["Expression"].get("properties", {}):
+        pytest.skip("the pinned ossie submodule predates the portable `sql` form")
+    repo_root = Path(__file__).resolve().parents[2] / "ossie"
+    ossie = yaml.safe_load(
+        (repo_root / "examples" / "tpcds_semantic_model.yaml").read_text(encoding="utf-8")
+    )
+    for element in [f for d in ossie["datasets"] for f in d["fields"]] + ossie["metrics"]:
+        element["expression"] = _ansi_to_sql_form(element["expression"])
+    jsonschema.validate(ossie, schema)
+
+
 def _ansi_to_sql_form(expression):
     """Rewrite an expression's ANSI_SQL entry as the portable ``sql`` form."""
     text = next(e["expression"] for e in expression["dialects"] if e["dialect"] == "ANSI_SQL")
@@ -991,13 +1033,16 @@ def test_all_tpcds_example_metrics_translate_to_dax(form):
             element["expression"] = _ansi_to_sql_form(element["expression"])
     # The portable `sql` form reads as OSSIE_SQL_2026.
     dialect = "OSSIE_SQL_2026" if form == "sql" else form
-
-    schema = json.loads(
-        (repo_root / "core-spec" / "ossie-schema.json").read_text(encoding="utf-8")
+    full_name = next(
+        f for d in ossie["datasets"] for f in d["fields"] if f["name"] == "customer_full_name"
     )
-    if form != "sql" or "sql" in schema["$defs"]["Expression"]["properties"]:
-        # Validate the `sql` form once the pinned spec defines it.
-        jsonschema.validate(ossie, schema)
+    # Newer spec examples carry `sql` next to the ANSI_SQL copy; `sql` then wins.
+    column_dialect = "OSSIE_SQL_2026" if "sql" in full_name["expression"] else dialect
+
+    if form != "sql":
+        # The `sql` form is validated in its own test, which needs a pinned spec that
+        # defines it.
+        jsonschema.validate(ossie, _core_schema())
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1007,7 +1052,7 @@ def test_all_tpcds_example_metrics_translate_to_dax(form):
     assert column["expression"] == (
         "'customer'[c_first_name] & \" \" & 'customer'[c_last_name]"
     )
-    assert _annotation(column, "OssieExpressionDialect") == dialect
+    assert _annotation(column, "OssieExpressionDialect") == column_dialect
 
     measures = {
         measure["name"]: measure

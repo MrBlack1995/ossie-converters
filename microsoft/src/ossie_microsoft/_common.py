@@ -58,6 +58,9 @@ VENDOR = "POWER_BI"
 DIALECT_DAX = "DAX"
 DIALECT_ANSI = "ANSI_SQL"
 DIALECT_OSSIE_SQL = "OSSIE_SQL_2026"
+# Key under which dialect_expressions() returns an expression's portable `sql` form; it
+# is read as OSSIE_SQL_2026 but kept apart so it can outrank the dialect entries.
+PORTABLE_SQL = "sql"
 
 # Power BI relationship properties whose meaning is tied to a specific endpoint pair.
 # Both converter directions use this set to avoid replaying stale vendor metadata after
@@ -342,9 +345,8 @@ def foreign_vendor_extensions(obj):
 def dialect_expressions(expression):
     """Return an Apache Ossie expression's {dialect: expression} mapping.
 
-    The portable ``sql`` form is ``OSSIE_SQL_2026`` by definition, so it is returned
-    under that dialect; as the primary form it wins over an ``OSSIE_SQL_2026`` entry
-    in ``dialects``.
+    The portable ``sql`` form is returned under ``PORTABLE_SQL``, apart from the
+    ``dialects`` entries, so the caller can rank it as the primary form.
     """
     result = {}
     for entry in (expression or {}).get("dialects") or []:
@@ -360,7 +362,7 @@ def dialect_expressions(expression):
     if sql is not None and not isinstance(sql, str):
         raise ConversionError(f"sql must be a string, got {type(sql).__name__}")
     if sql:
-        result[DIALECT_OSSIE_SQL] = sql
+        result[PORTABLE_SQL] = sql
     return result
 
 
