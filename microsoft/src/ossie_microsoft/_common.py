@@ -340,7 +340,12 @@ def foreign_vendor_extensions(obj):
 
 
 def dialect_expressions(expression):
-    """Return an Apache Ossie expression's {dialect: expression} mapping."""
+    """Return an Apache Ossie expression's {dialect: expression} mapping.
+
+    The portable ``sql`` form is ``OSSIE_SQL_2026`` by definition, so it is returned
+    under that dialect; as the primary form it wins over an ``OSSIE_SQL_2026`` entry
+    in ``dialects``.
+    """
     result = {}
     for entry in (expression or {}).get("dialects") or []:
         if not isinstance(entry, dict):
@@ -351,6 +356,11 @@ def dialect_expressions(expression):
                 f"expression must be a string, got {type(expr).__name__}")
         if dialect and expr:
             result[dialect] = expr
+    sql = (expression or {}).get("sql")
+    if sql is not None and not isinstance(sql, str):
+        raise ConversionError(f"sql must be a string, got {type(sql).__name__}")
+    if sql:
+        result[DIALECT_OSSIE_SQL] = sql
     return result
 
 

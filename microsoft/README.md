@@ -363,6 +363,8 @@ when fewer than two non-blank rows remain, where SQL yields NULL or 0.
 
 `ANSI_SQL`, `OSSIE_SQL_2026`, `SNOWFLAKE`, `DATABRICKS` and `BIGQUERY` expressions are
 parsed; `MDX`, `TABLEAU` and `MAQL` are not SQL and are not attempted.
+An expression's portable `sql` form is read as `OSSIE_SQL_2026`, and wins over an
+`OSSIE_SQL_2026` entry in `dialects`.
 For multi-dialect expressions, export prefers `DAX`, then `ANSI_SQL`, then
 `OSSIE_SQL_2026`, then another readable SQL dialect. It does not try another
 dialect after a selected expression fails translation: the failure is reported

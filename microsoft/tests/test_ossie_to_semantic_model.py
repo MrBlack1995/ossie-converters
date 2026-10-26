@@ -818,6 +818,50 @@ def test_an_ossie_sql_metric_is_translated_to_dax():
     assert _metric_dax("SUM(c)", "OSSIE_SQL_2026") == "SUM('T'[C])"
 
 
+def _metric_dax_for(expression):
+    """Convert a single-metric model with the given expression object; return its DAX."""
+    semantic_model = _minimal(metrics=[{"name": "M", "expression": expression}])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bim = _convert(semantic_model)
+    measures = _table(bim, "T").get("measures") or []
+    return measures[0]["expression"] if measures else None
+
+
+def test_a_portable_sql_metric_is_translated_to_dax():
+    assert _metric_dax_for({"sql": "SUM(c)"}) == "SUM('T'[C])"
+
+
+def test_the_portable_sql_form_wins_over_an_ossie_sql_dialect_entry():
+    expression = {
+        "sql": "SUM(c)",
+        "dialects": [{"dialect": "OSSIE_SQL_2026", "expression": "MIN(c)"}],
+    }
+    assert _metric_dax_for(expression) == "SUM('T'[C])"
+
+
+def test_a_dax_variant_is_still_preferred_over_the_portable_sql_form():
+    expression = {
+        "sql": "SUM(c)",
+        "dialects": [{"dialect": "DAX", "expression": "SUMX('T', 'T'[C])"}],
+    }
+    assert _metric_dax_for(expression) == "SUMX('T', 'T'[C])"
+
+
+def test_a_portable_sql_field_becomes_a_source_column():
+    semantic_model = _minimal()
+    semantic_model["datasets"][0]["fields"][0]["expression"] = {"sql": "c"}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bim = _convert(semantic_model)
+    assert _column(_table(bim, "T"), "C")["sourceColumn"] == "c"
+
+
+def test_a_non_string_portable_sql_form_is_rejected():
+    with pytest.raises(ConversionError, match="sql must be a string"):
+        _metric_dax_for({"sql": 42})
+
+
 @pytest.mark.parametrize(
     ("dialects", "expected_dax", "expected_dialect"),
     [
@@ -923,27 +967,37 @@ def test_dax_is_preferred_over_ossie_sql():
     assert "annotations" not in measure
 
 
-@pytest.mark.parametrize("dialect", ["ANSI_SQL", "OSSIE_SQL_2026"])
-def test_all_tpcds_example_metrics_translate_to_dax(dialect):
+def _ansi_to_sql_form(expression):
+    """Rewrite an expression's ANSI_SQL entry as the portable ``sql`` form."""
+    text = next(e["expression"] for e in expression["dialects"] if e["dialect"] == "ANSI_SQL")
+    return {"sql": text}
+
+
+@pytest.mark.parametrize("form", ["ANSI_SQL", "OSSIE_SQL_2026", "sql"])
+def test_all_tpcds_example_metrics_translate_to_dax(form):
     repo_root = Path(__file__).resolve().parents[2] / "ossie"
     ossie = yaml.safe_load(
         (repo_root / "examples" / "tpcds_semantic_model.yaml").read_text(encoding="utf-8")
     )
-    if dialect == "OSSIE_SQL_2026":
-        for dataset in ossie["datasets"]:
-            for field in dataset["fields"]:
-                for entry in field["expression"]["dialects"]:
-                    if entry["dialect"] == "ANSI_SQL":
-                        entry["dialect"] = dialect
-        for metric in ossie["metrics"]:
-            for entry in metric["expression"]["dialects"]:
+    elements = [field for dataset in ossie["datasets"] for field in dataset["fields"]]
+    elements += ossie["metrics"]
+    if form == "OSSIE_SQL_2026":
+        for element in elements:
+            for entry in element["expression"]["dialects"]:
                 if entry["dialect"] == "ANSI_SQL":
-                    entry["dialect"] = dialect
+                    entry["dialect"] = form
+    elif form == "sql":
+        for element in elements:
+            element["expression"] = _ansi_to_sql_form(element["expression"])
+    # The portable `sql` form reads as OSSIE_SQL_2026.
+    dialect = "OSSIE_SQL_2026" if form == "sql" else form
 
     schema = json.loads(
         (repo_root / "core-spec" / "ossie-schema.json").read_text(encoding="utf-8")
     )
-    jsonschema.validate(ossie, schema)
+    if form != "sql" or "sql" in schema["$defs"]["Expression"]["properties"]:
+        # Validate the `sql` form once the pinned spec defines it.
+        jsonschema.validate(ossie, schema)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
