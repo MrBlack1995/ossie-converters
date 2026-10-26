@@ -862,6 +862,30 @@ def test_the_portable_sql_form_wins_over_a_stale_ansi_sql_entry():
     assert _annotation(measure, "OssieExpressionDialect") == "OSSIE_SQL_2026"
 
 
+def test_a_dialect_entry_named_sql_is_opaque_not_the_portable_form():
+    # Any non-empty string is a valid dialect name, so `dialect: sql` is an opaque
+    # dialect like any other: the ANSI_SQL entry is exported, as without `sql` support.
+    semantic_model = _minimal(
+        metrics=[
+            {
+                "name": "M",
+                "expression": {
+                    "dialects": [
+                        {"dialect": "sql", "expression": "SUM(c)"},
+                        {"dialect": "ANSI_SQL", "expression": "MIN(c)"},
+                    ]
+                },
+            }
+        ]
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        bim = _convert(semantic_model)
+    measure = _table(bim, "T")["measures"][0]
+    assert measure["expression"] == "MIN('T'[C])"
+    assert _annotation(measure, "OssieExpressionDialect") == "ANSI_SQL"
+
+
 def test_a_dax_variant_is_still_preferred_over_the_portable_sql_form():
     expression = {
         "sql": "SUM(c)",

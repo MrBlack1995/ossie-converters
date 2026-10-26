@@ -59,8 +59,11 @@ DIALECT_DAX = "DAX"
 DIALECT_ANSI = "ANSI_SQL"
 DIALECT_OSSIE_SQL = "OSSIE_SQL_2026"
 # Key under which dialect_expressions() returns an expression's portable `sql` form; it
-# is read as OSSIE_SQL_2026 but kept apart so it can outrank the dialect entries.
-PORTABLE_SQL = "sql"
+# is read as OSSIE_SQL_2026 but kept apart so it can outrank the dialect entries. Any
+# non-empty string is a valid dialect name (even "sql"), so the key is the empty string,
+# which no dialect entry can use: the schema requires a non-empty dialect and
+# dialect_expressions() skips empty ones.
+PORTABLE_SQL = ""
 
 # Power BI relationship properties whose meaning is tied to a specific endpoint pair.
 # Both converter directions use this set to avoid replaying stale vendor metadata after
