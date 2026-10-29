@@ -437,3 +437,13 @@ def test_a_too_deep_measure_does_not_stop_the_import(bim):
     document = _build(model, translate_dax=True)
     assert list(_dialects(_metric(document, "Deep"))) == ["DAX"]
     assert _dialects(_metric(document, "Total Sales"))["OSSIE_SQL_2026"] == "SUM(Sales.Amount)"
+
+
+def test_a_refusal_deep_in_a_chain_names_only_the_measure_where_it_failed():
+    measures = {"C0": "COUNTROWS(Sales)"}
+    for level in range(1, 50):
+        measures[f"C{level}"] = f"[C{level - 1}] * 2"
+    sql, reason = translate_measure("[C49]", resolve, measures)
+    assert sql is None
+    assert reason.startswith("referenced measure [C0] is not translated:")
+    assert reason.count("referenced measure") == 1

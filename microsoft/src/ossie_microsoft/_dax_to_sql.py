@@ -335,6 +335,10 @@ class _Translator:
         try:
             return self.translate(tree, {})
         except _RefusedError as refusal:
+            if str(refusal).startswith("referenced measure ["):
+                # Already names the measure where it failed; wrapping it again at every
+                # level would grow the diagnostic with the length of the chain.
+                raise
             raise _RefusedError(
                 f"referenced measure [{name}] is not translated: {refusal}"
             ) from None
