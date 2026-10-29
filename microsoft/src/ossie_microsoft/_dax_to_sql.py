@@ -146,6 +146,13 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _ADD, _MUL, _ATOM = 1, 2, 3
 
 
+# Longest SQL fragment the translator emits. The BLANK guard on `+` and `-` repeats its
+# operands and measure references are expanded inline, so a chain of derived measures
+# can double the SQL at every level; past this size the measure is refused (kept as
+# DAX) rather than emitted as megabytes of SQL.
+_MAX_SQL_LENGTH = 4000
+
+
 class _RefusedError(Exception):
     """Raised inside the translator; its message is the refusal reason."""
 
@@ -155,6 +162,15 @@ class _Sql:
     text: str
     precedence: int
     nullable: bool
+
+    def __post_init__(self):
+        # Checked on every fragment, so a growing expression stops at the first
+        # fragment over the limit instead of after it has been built.
+        if len(self.text) > _MAX_SQL_LENGTH:
+            raise _RefusedError(
+                f"the expression is too large to translate exactly (over "
+                f"{_MAX_SQL_LENGTH} characters of SQL)"
+            )
 
 
 def translate_measure(expression, resolve, measures=None):
@@ -169,15 +185,23 @@ def translate_measure(expression, resolve, measures=None):
     caller keeps the original DAX and attaches ``reason`` as a diagnostic when a
     measure is refused.
     """
+    # The parser and the translator are recursive, so a deeply nested expression or a
+    # long chain of measure references could exhaust the stack; that one measure is
+    # then kept as DAX instead of ending the whole import.
+    too_deep = "the expression is too deeply nested to translate"
     try:
         tree = parse_dax(expression)
     except DaxParseError as error:
         return None, f"the DAX could not be parsed ({error})"
+    except RecursionError:
+        return None, too_deep
     translator = _Translator(resolve, measures)
     try:
         return translator.translate(tree, {}).text, None
     except _RefusedError as refusal:
         return None, str(refusal)
+    except RecursionError:
+        return None, too_deep
 
 
 class _Translator:

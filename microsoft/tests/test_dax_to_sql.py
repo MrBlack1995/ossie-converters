@@ -391,3 +391,49 @@ def test_a_referenced_measure_that_does_not_parse_is_refused():
     sql, reason = translate_measure("[Broken] * 2", resolve, measures)
     assert sql is None
     assert "referenced measure [Broken] could not be parsed" in reason
+
+
+# --- Robustness: size and depth limits (review on #27) -----------------------
+
+
+def _chain(levels):
+    """M1 = [A] - [A], M2 = [M1] - [A], ...: each level repeats both nullable operands."""
+    measures = {"A": "SUM(Sales[Amount])", "M1": "[A] - [A]"}
+    for level in range(2, levels + 1):
+        measures[f"M{level}"] = f"[M{level - 1}] - [A]"
+    return measures
+
+
+def test_a_short_measure_chain_still_translates():
+    sql, reason = translate_measure("[M3]", resolve, _chain(3))
+    assert reason is None, reason
+    assert len(sql) < 4000
+
+
+def test_a_long_chain_of_guarded_measures_is_refused_not_emitted():
+    # Each level at least doubles the SQL; without a cap 30 levels are gigabytes.
+    sql, reason = translate_measure("[M30]", resolve, _chain(30))
+    assert sql is None
+    assert "too large to translate exactly" in reason
+
+
+def test_a_deeply_nested_expression_is_refused_not_raised():
+    sql, reason = translate_measure("(" * 2000 + "1" + ")" * 2000, resolve)
+    assert sql is None
+    assert reason == "the expression is too deeply nested to translate"
+
+
+def test_a_very_long_chain_of_measure_references_is_refused_not_raised():
+    measures = {"B0": "SUM(Sales[Amount])"}
+    for level in range(1, 3000):
+        measures[f"B{level}"] = f"[B{level - 1}]"
+    sql, reason = translate_measure("[B2999]", resolve, measures)
+    assert sql is None
+    assert "too deeply nested" in reason
+
+
+def test_a_too_deep_measure_does_not_stop_the_import(bim):
+    model = _bim_with_measures(bim, {"Deep": "(" * 2000 + "1" + ")" * 2000})
+    document = _build(model, translate_dax=True)
+    assert list(_dialects(_metric(document, "Deep"))) == ["DAX"]
+    assert _dialects(_metric(document, "Total Sales"))["OSSIE_SQL_2026"] == "SUM(Sales.Amount)"
