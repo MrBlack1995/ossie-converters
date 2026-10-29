@@ -647,3 +647,13 @@ def test_a_refusal_deep_in_a_chain_names_only_the_measure_where_it_failed():
     assert sql is None
     assert reason.startswith("referenced measure [C0] is not translated:")
     assert reason.count("referenced measure") == 1
+
+
+def test_the_size_cap_also_covers_mod_repeating_its_operands():
+    # MOD writes both operands twice (n - d * FLOOR(n / d)), so nesting doubles the SQL.
+    expr = "COALESCE(SUM(Sales[Amount]), 0)"
+    for _ in range(25):
+        expr = f"MOD({expr}, 7)"
+    sql, reason = translate_measure(expr, resolve)
+    assert sql is None
+    assert "too large to translate exactly" in reason
