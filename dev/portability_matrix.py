@@ -43,10 +43,12 @@ Columns (counts over the metrics of every fixture, as graded by `grade.py`):
   placeholder PLACEHOLDER: a valid stand-in (e.g. BLANK()) replaced the content
   dropped     DROPPED_DIAGNOSED + DROPPED_SILENT
   rejected    fixtures the converter refused as a whole (non-zero exit, or REJECTED)
+  added       ADDED: metrics the converter invented; not counted in `metrics`
 
 Each converter runs in its own `uv` environment, as in `cube/tools/interop_matrix.py`,
 so the first run for a converter resolves its dependencies there. A converter whose
-environment cannot be built is reported as SKIP, not as a failure. Converters that
+environment cannot be built, or whose local path dependency (`../ossie/python`, from
+the `ossie` submodule) is missing, is reported as SKIP with the reason, not as a failure. Converters that
 cannot round-trip from the command line (export-only, API-only, or Java) are listed
 with the reason rather than scored.
 
@@ -206,6 +208,7 @@ def converter_argv(converter, template, input_path, output_path, python, cwd):
     return [python, "-c", source, *args]
 
 
+_PATH_DEPENDENCY = re.compile(r'\{\s*path\s*=\s*"([^"]+)"')
 _SCRIPT_LINE = re.compile(r'^\s*"?([A-Za-z0-9_.-]+)"?\s*=\s*"([A-Za-z0-9_.]+):([A-Za-z0-9_]+)"')
 
 
@@ -227,7 +230,10 @@ def entry_point(cwd, script):
 
 
 def round_trip(converter, fixture, work, root, python):
-    """Ossie -> vendor -> Ossie for one fixture. Returns (returned path or None, log)."""
+    """Ossie -> vendor -> Ossie for one fixture.
+
+    Returns (returned path or None, log, environment failure, one-line failure detail).
+    """
     cwd = root / converter.directory
     vendor = work / converter.vendor.rstrip("/")
     returned = work / "returned.ossie.yaml"
@@ -236,13 +242,15 @@ def round_trip(converter, fixture, work, root, python):
     export = run(converter_argv(converter, converter.export, fixture, vendor, python, cwd), cwd)
     log.append(export.stderr)
     if export.returncode != 0:
-        return None, "\n".join(log), _is_env_failure(export.stderr)
+        return None, "\n".join(log), _is_env_failure(export.stderr), \
+            rejection_detail(export.stderr)
 
     import_inputs = [vendor]
     if converter.import_glob:
         import_inputs = sorted(vendor.glob(converter.import_glob))
         if not import_inputs:
-            return None, "\n".join(log + ["export wrote no files to import"]), False
+            return None, "\n".join(log + ["export wrote no files to import"]), False, \
+                "export wrote no files to import"
     template = list(converter.import_)
     position = template.index("{input}")
     expanded = template[:position] + [str(p) for p in import_inputs] + template[position + 1:]
@@ -250,12 +258,49 @@ def round_trip(converter, fixture, work, root, python):
     imported = run(argv, cwd)
     log.append(imported.stderr)
     if imported.returncode != 0 or not returned.exists():
-        return None, "\n".join(log), _is_env_failure(imported.stderr)
-    return returned, "\n".join(log), False
+        return None, "\n".join(log), _is_env_failure(imported.stderr), \
+            rejection_detail(imported.stderr)
+    return returned, "\n".join(log), False, ""
 
 
 def _is_env_failure(stderr):
     return any(marker in stderr for marker in _ENV_FAILURE_MARKERS)
+
+
+def rejection_detail(stderr):
+    """One line saying why a step failed.
+
+    Most converters print their reason last. Some (ThoughtSpot) print their issue log as
+    a JSON array, whose last line is a bare `]`; for those, the last ERROR message.
+    """
+    text = stderr.strip()
+    try:
+        issues = json.loads(text)
+    except ValueError:
+        issues = None
+    if isinstance(issues, list):
+        errors = [i.get("message") for i in issues
+                  if isinstance(i, dict) and i.get("severity") == "ERROR" and i.get("message")]
+        if errors:
+            return str(errors[-1])
+    return (text.splitlines() or [""])[-1]
+
+
+def missing_path_dependency(cwd):
+    """A local path dependency in cwd/pyproject.toml that is missing, or None.
+
+    dbt, sigma and wisdom depend on `../ossie/python`. With the `ossie` submodule not
+    checked out, uv fails with a message that is not a converter rejecting the model, so
+    the converter is skipped with this reason instead.
+    """
+    pyproject = cwd / "pyproject.toml"
+    if not pyproject.exists():
+        return None
+    for match in _PATH_DEPENDENCY.finditer(pyproject.read_text()):
+        target = (cwd / match.group(1)).resolve()
+        if not (target / "pyproject.toml").exists():
+            return match.group(1)
+    return None
 
 
 def grade(grader, grader_python, fixture, returned, diagnostics, converter_name):
@@ -285,6 +330,11 @@ def tally(reports):
                 continue
             outcome = finding.get("outcome")
             detail = finding.get("detail", "")
+            if outcome == "ADDED":
+                # Invented by the converter, not authored: neither portable nor counted
+                # in the authored metrics.
+                counts["added"] += 1
+                continue
             counts["metrics"] += 1
             if outcome in PORTABLE_OUTCOMES:
                 counts["portable"] += 1
@@ -344,18 +394,20 @@ def main(argv=None):
     matrix = {}
     try:
         for converter in selected:
-            reports, skipped = [], False
-            for variant, fixture in fixtures:
+            reports, skipped = [], None
+            missing = None if args.python else missing_path_dependency(root / converter.directory)
+            if missing:
+                skipped = f"path dependency {missing} is missing; run git submodule update --init"
+            for variant, fixture in fixtures if not skipped else ():
                 work = out / converter.name / variant
                 work.mkdir(parents=True)
-                returned, log, env_failure = round_trip(
+                returned, log, env_failure, detail = round_trip(
                     converter, fixture, work, root, args.python)
                 if env_failure:
-                    skipped = True
+                    skipped = "converter environment could not be built"
                     break
                 if returned is None:
-                    reports.append({"variant": variant, "rejected": True,
-                                    "detail": (log.strip().splitlines() or [""])[-1]})
+                    reports.append({"variant": variant, "rejected": True, "detail": detail})
                     continue
                 diagnostics = work / "diagnostics.txt"
                 diagnostics.write_text(log)
@@ -380,7 +432,7 @@ def main(argv=None):
 
 
 def print_table(fixtures, matrix):
-    columns = ("portable", "review", "vendor", "placeholder", "dropped", "rejected")
+    columns = ("portable", "review", "vendor", "placeholder", "dropped", "rejected", "added")
     print(f"fixtures: {len(fixtures)} variants")
     print()
     header = f"{'converter':<24}" + "".join(f"{c:>12}" for c in columns) + f"{'metrics':>9}"
@@ -388,7 +440,7 @@ def print_table(fixtures, matrix):
     print("-" * len(header))
     for name, entry in matrix.items():
         if entry["skipped"]:
-            print(f"{name:<24}  SKIP (converter environment could not be built)")
+            print(f"{name:<24}  SKIP ({entry['skipped']})")
             continue
         counts = entry["counts"]
         print(f"{name:<24}" + "".join(f"{counts.get(c, 0):>12}" for c in columns)

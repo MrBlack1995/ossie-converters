@@ -68,13 +68,47 @@ def test_tally_counts_metrics_only_and_splits_rewritten():
             {"kind": "metric", "outcome": "SURVIVED_VENDOR_ONLY"},
             {"kind": "metric", "outcome": "PLACEHOLDER"},
             {"kind": "metric", "outcome": "DROPPED_SILENT"},
+            {"kind": "metric", "outcome": "ADDED"},
             {"kind": "field", "outcome": "SURVIVED_VENDOR_ONLY"},
         ]},
         {"rejected": True},
     ]
     counts = pm.tally(reports)
+    # An ADDED metric was invented by the converter: its own column, not an authored metric.
     assert counts == {"metrics": 7, "portable": 3, "review": 1, "vendor": 1,
-                      "placeholder": 1, "dropped": 1, "rejected": 1}
+                      "placeholder": 1, "dropped": 1, "rejected": 1, "added": 1}
+
+
+def test_rejection_detail_reads_a_json_issue_log():
+    issues = (
+        '[\n  {"severity": "WARNING", "message": "w"},\n'
+        '  {"severity": "ERROR", "message": "first error"},\n'
+        '  {"severity": "ERROR", "message": "no usable ANSI_SQL expression"}\n]'
+    )
+    assert pm.rejection_detail(issues) == "no usable ANSI_SQL expression"
+
+
+def test_rejection_detail_falls_back_to_the_last_line():
+    assert pm.rejection_detail("warning: x\nError: refused\n") == "Error: refused"
+    assert pm.rejection_detail("[1, 2]") == "[1, 2]"
+    assert pm.rejection_detail("") == ""
+
+
+def test_a_missing_path_dependency_is_reported(tmp_path):
+    converter = tmp_path / "dbt"
+    converter.mkdir()
+    (converter / "pyproject.toml").write_text(
+        '[tool.uv.sources]\napache-ossie = { path = "../ossie/python", editable = true}\n'
+    )
+    assert pm.missing_path_dependency(converter) == "../ossie/python"
+    (tmp_path / "ossie" / "python").mkdir(parents=True)
+    (tmp_path / "ossie" / "python" / "pyproject.toml").write_text("[project]\n")
+    assert pm.missing_path_dependency(converter) is None
+
+
+def test_converters_with_a_path_dependency_find_it_in_this_checkout():
+    for name in ("dbt", "sigma", "wisdom"):
+        assert pm.missing_path_dependency(pm.repo_root() / name) is None
 
 
 def test_missing_fixtures_explain_the_submodule(tmp_path):
