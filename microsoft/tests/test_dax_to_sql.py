@@ -238,7 +238,8 @@ def test_var_return_is_substituted():
         ("[Nope]", "is not a measure of this model"),
         ("VAR a = 1 RETURN b", "'b' is not a variable"),
         ("SUM('Sales'[Amount]) / 0", "the / operator"),
-        ("CALCULATE(SUM('Sales'[Amount]), 'Sales'[Status] = \"done\")", "filter-context"),
+        ("CALCULATE(SUM('Sales'[Amount]), 'Sales'[Status] = \"done\")",
+         "replaces the outer filter"),
         ("TOTALYTD(SUM('Sales'[Amount]), 'Date'[Date])", "window measures"),
         ("SUMMARIZE('Sales', 'Sales'[Status])", "returns a table"),
         ("FOO('Sales'[Amount])", "not a DAX function known"),
@@ -449,7 +450,7 @@ def test_translates_logic(dax, expected):
     [
         ('SWITCH([Customers], 1, "one", "many")', "SWITCH matching a value"),
         ('IF([Total Sales] > 0, "High", 0)', "results of different types"),
-        ('"a" = "b"', "comparison on a text value"),
+        ('"a" = "b"', "two text literals"),
         ("ISBLANK([Total Sales]) + 1", "arithmetic or comparison on a boolean"),
         ("IF(ISBLANK([Total Sales]), TRUE(), BLANK()) && TRUE()", "logical operand"),
         ("IF('Sales'[Amount] > 0, 1, 0)", "bare column reference"),

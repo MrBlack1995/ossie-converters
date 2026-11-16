@@ -99,7 +99,7 @@ def test_sumx_follows_dax_blank_rules_on_sqlite():
         ("SUMX('Sales', SUM('Sales'[Qty]))", "nested aggregation"),
         ("SUMX('Sales', SUMX('Sales', 'Sales'[Qty]))", "nested aggregation"),
         ("SUMX('Sales', 1)", "reads no column"),
-        ("SUMX(FILTER('Sales', 'Sales'[Qty] > 1), 'Sales'[Qty])", "table named directly"),
+        ("SUMX(VALUES('Sales'[Qty]), 'Sales'[Qty])", "table named directly"),
         ("SUMX('Sales', 'Sales'[Customer])", "SUMX of a text row expression"),
         ("COUNTX('Sales', 'Sales'[Paid])", "COUNTX of a boolean row expression"),
         ("SUMX('Sales')", "takes 2 arguments"),
