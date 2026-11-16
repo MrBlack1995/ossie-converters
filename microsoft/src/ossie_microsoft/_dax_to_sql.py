@@ -305,7 +305,7 @@ TRANSLATED_FUNCTIONS = frozenset(_AGGREGATES) | frozenset(
      "DEGREES", "RADIANS")
 ) | {
     "DIVIDE", "IF", "IF.EAGER", "SWITCH", "COALESCE", "BLANK", "ISBLANK",
-    "TRUE", "FALSE", "AND", "OR", "NOT",
+    "TRUE", "FALSE", "AND", "OR", "NOT", "FILTER", "KEEPFILTERS",
     "LEFT", "RIGHT", "MID", "LEN", "UPPER", "LOWER", "CONCATENATE",
     "YEAR", "QUARTER", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "DATE", "EDATE",
     "EOMONTH",
@@ -464,6 +464,9 @@ class _Translator:
         # other X-iterators over ``iter_table``; ``reads`` counts the columns it reads.
         self.iter_table = iter_table
         self.reads = 0
+        # Filters of the enclosing CALCULATE(..., KEEPFILTERS(...) / FILTER(...)): a list of
+        # (table, condition) that every aggregate in the expression is restricted by.
+        self.filters = []
         self.measures = {name.upper(): dax for name, dax in (measures or {}).items()}
         self.expanding = []
         # Row context: set when translating a calculated column of ``row_table``.
@@ -550,6 +553,8 @@ class _Translator:
             if node.name == "PERCENTILE.INC":
                 return self.percentile(node, variables)
             return self.column_aggregate(node)
+        if node.name == "CALCULATE":
+            return self.calculate(node, variables)
         if node.name == "DIVIDE":
             return self.divide(node, variables)
         if node.name in _LOGIC_FUNCTIONS:
@@ -587,9 +592,9 @@ class _Translator:
             raise _RefusedError("a dataset or field name needing SQL quoting is a later tier")
         # A count is a number; the other aggregates take the type of their column.
         kind = _NUM if node.name in _COUNTS else _column_kind(datatype)
-        return _Sql(
-            _AGGREGATES[node.name].format(f"{dataset}.{field}"), _ATOM, nullable=True, kind=kind
-        )
+        text = self.filtered(_AGGREGATES[node.name].format(f"{dataset}.{field}"), column.table,
+                             node.name)
+        return _Sql(text, _ATOM, nullable=True, kind=kind)
 
     def column_field(self, node, function):
         """Resolve the one ``Table[Column]`` argument of an aggregate to (sql, kind)."""
@@ -618,7 +623,8 @@ class _Translator:
         field, kind = self.column_field(node, node.name)
         if kind not in accepted:
             raise _RefusedError(_aggregate_kind_reason(node.name, kind))
-        return _Sql(template.format(c=field), _ATOM, nullable=True, kind=result)
+        text = self.filtered(template.format(c=field), node.args[0].table, node.name)
+        return _Sql(text, _ATOM, nullable=True, kind=result)
 
     def percentile(self, node, variables):
         """PERCENTILE.INC(column, k) -> PERCENTILE_CONT(k) WITHIN GROUP (ORDER BY column).
@@ -638,7 +644,8 @@ class _Translator:
                 "PERCENTILE.INC is translated only with a literal k between 0 and 1 (DAX "
                 "raises an error outside that range)"
             )
-        return _Sql(f"PERCENTILE_CONT({k.text}) WITHIN GROUP (ORDER BY {field})", _ATOM, True)
+        text = f"PERCENTILE_CONT({k.text}) WITHIN GROUP (ORDER BY {field})"
+        return _Sql(self.filtered(text, node.args[0].table, "PERCENTILE.INC"), _ATOM, True)
 
     def iterator(self, node, variables):
         """SUMX(Table, expression) and the other X-iterators -> the aggregate of the row
@@ -655,14 +662,21 @@ class _Translator:
         if len(node.args) != expected:
             raise _RefusedError(f"{node.name} takes {expected} arguments")
         table = node.args[0]
-        if isinstance(table, (Table, Name)) and not (
+        row_filter = []
+        if isinstance(table, Call) and table.name == "FILTER":
+            # FILTER(T, condition) keeps the rows of T, in the current filter context, on
+            # which the condition holds: the aggregate over exactly those rows.
+            row_filter = [self.filter_table(table)]
+            table_name = row_filter[0][0]
+        elif isinstance(table, (Table, Name)) and not (
             isinstance(table, Name) and table.name.upper() in variables
         ):
             table_name = table.name
         else:
             raise _RefusedError(
-                f"{node.name} is translated only over a table named directly; a table "
-                "expression (FILTER, VALUES, ...) is a later tier"
+                f"{node.name} is translated only over a table named directly or "
+                "FILTER(table, condition); another table expression (VALUES, ALL, ...) is "
+                "a later tier"
             )
         inner = _Translator(self.resolve, None, iter_table=table_name)
         value = inner.translate(node.args[1], {})
@@ -685,6 +699,7 @@ class _Translator:
             text = f"PERCENTILE_CONT({k.text}) WITHIN GROUP (ORDER BY {value.text})"
         else:
             text = template.format(value.text)
+        text = self.filtered(text, table_name, node.name, row_filter)
         result = value.kind if node.name in ("MINX", "MAXX") else _NUM
         return _Sql(text, _ATOM, nullable=True, kind=result)
 
@@ -811,11 +826,39 @@ class _Translator:
         raise _RefusedError(f"a {fragment.kind} value is not a condition")
 
     def comparison(self, node, variables):
+        if node.op in ("=", "<>") and (isinstance(node.left, String)
+                                        or isinstance(node.right, String)):
+            return self.text_equality(node, variables)
         # DAX compares a BLANK number as 0 (BLANK = 0 is TRUE); SQL would give NULL.
         left = self.number(node.left, variables)
         right = self.number(node.right, variables)
         text = f"{_blank_as_zero(left)} {_COMPARISONS[node.op]} {_blank_as_zero(right)}"
         return _Sql(text, _CMP, False, _BOOL)
+
+    def text_equality(self, node, variables):
+        """``text = "literal"`` and ``<>``: DAX compares text without regard to case, and a
+        BLANK as the empty string ("" = BLANK() is TRUE). The spec's ILIKE is the
+        case-insensitive match, so ``COALESCE(text, '') ILIKE 'literal'`` is the same test.
+        A literal holding an ILIKE wildcard (``%``, ``_``) or a backslash is refused rather
+        than escaped, since the spec defines no escape character.
+        """
+        literal, other = (node.left, node.right) if isinstance(node.left, String) else (
+            node.right, node.left)
+        if isinstance(other, String):
+            raise _RefusedError("a comparison of two text literals is a later tier")
+        if any(c in literal.value for c in "%_\\"):
+            raise _RefusedError(
+                "a text comparison with %, _ or a backslash in the literal is not translated: "
+                "ILIKE treats them as wildcards and the spec defines no escape character"
+            )
+        value = self.translate(other, variables)
+        if value.kind not in (_TEXT, _BLANK):
+            raise _RefusedError(f"comparing a {value.kind} value with text is not translated")
+        pattern = "'" + literal.value.replace("'", "''") + "'"
+        test = f"COALESCE({value.text}, '') ILIKE {pattern}"
+        if node.op == "<>":
+            return _Sql(f"NOT ({test})", _NOT, False, _BOOL)
+        return _Sql(test, _CMP, False, _BOOL)
 
     def strict_equality(self, node, variables):
         # == does not coerce BLANK: BLANK == 0 is FALSE, BLANK == BLANK is TRUE.
@@ -1155,15 +1198,118 @@ class _Translator:
     def var_block(self, node, variables):
         scope = dict(variables)
         for name, value in node.bindings:
-            scope[name.upper()] = (value, dict(scope))
+            # A variable is evaluated where it is defined: inside a CALCULATE it sees that
+            # CALCULATE's filters, and a CALCULATE that later reads it does not filter it.
+            scope[name.upper()] = (value, dict(scope), list(self.filters))
         return self.translate(node.body, scope)
 
     def variable(self, name, variables):
         binding = variables.get(name.upper())
         if binding is None:
             raise _RefusedError(f"'{name}' is not a variable defined in this measure")
-        value, scope = binding
-        return self.translate(value, scope)
+        value, scope, filters = binding
+        saved, self.filters = self.filters, filters
+        try:
+            return self.translate(value, scope)
+        finally:
+            self.filters = saved
+
+    # --- filtered aggregates: CALCULATE, FILTER, KEEPFILTERS ------------------
+
+    def calculate(self, node, variables):
+        """CALCULATE(expression, filter, ...) for filters that only narrow the context.
+
+        KEEPFILTERS(condition) and FILTER(table, condition) intersect with the filter the
+        metric is evaluated in, so every aggregate in the expression becomes the same
+        aggregate over the rows that also satisfy the condition: ``aggregate(...) FILTER
+        (WHERE condition)``. A plain filter argument (``'Sales'[Region] = "EU"``) instead
+        replaces the outer filter on its columns, and ALL / REMOVEFILTERS remove filters;
+        neither has a per-row form, so both are refused. In a row context CALCULATE also
+        performs context transition, which a metric expression cannot express.
+        """
+        if self.iter_table is not None or self.row_table is not None:
+            raise _RefusedError(
+                "CALCULATE in a row context performs context transition, which a metric "
+                "expression cannot express"
+            )
+        if not node.args:
+            raise _RefusedError("CALCULATE takes an expression to evaluate")
+        added = [self.filter_argument(arg) for arg in node.args[1:]]
+        saved = self.filters
+        self.filters = saved + added
+        try:
+            return self.translate(node.args[0], variables)
+        except _RefusedError as refusal:
+            if "CALCULATE" in str(refusal) or str(refusal).startswith("referenced measure ["):
+                raise
+            raise _RefusedError(
+                f"the expression in CALCULATE is not translated: {refusal}"
+            ) from None
+        finally:
+            self.filters = saved
+
+    def filter_argument(self, arg):
+        """One filter argument of CALCULATE, as a (table, condition) pair."""
+        if isinstance(arg, Call) and arg.name == "KEEPFILTERS":
+            if len(arg.args) != 1:
+                raise _RefusedError("KEEPFILTERS takes one filter")
+            inner = arg.args[0]
+            if isinstance(inner, Call) and inner.name == "FILTER":
+                return self.filter_table(inner)
+            return self.filter_condition(_single_table(inner, "KEEPFILTERS"), inner, "KEEPFILTERS")
+        if isinstance(arg, Call) and arg.name == "FILTER":
+            return self.filter_table(arg)
+        if isinstance(arg, Call) and arg.name in _FILTER_REMOVERS:
+            raise _RefusedError(
+                f"{arg.name} in CALCULATE removes filters from the context, which a metric "
+                "expression cannot express"
+            )
+        if _columns(arg):
+            raise _RefusedError(
+                "a plain CALCULATE filter replaces the outer filter on its columns, which a "
+                "per-row condition cannot express; KEEPFILTERS(...) keeps the outer filter "
+                "and is translated"
+            )
+        raise _RefusedError("this CALCULATE filter argument is a later tier")
+
+    def filter_table(self, call):
+        """FILTER(table, condition) over a table named directly, as (table, condition)."""
+        if len(call.args) != 2:
+            raise _RefusedError("FILTER takes a table and a condition")
+        table = call.args[0]
+        if not isinstance(table, (Table, Name)):
+            raise _RefusedError(
+                "FILTER is translated only over a table named directly; a table expression "
+                "(ALL, VALUES, ...) is a later tier"
+            )
+        return self.filter_condition(table.name, call.args[1], "FILTER")
+
+    def filter_condition(self, table, node, function):
+        """A row condition on ``table``'s own columns, translated in its row context."""
+        inner = _Translator(self.resolve, None, iter_table=table)
+        condition = inner.condition(node, {})
+        if inner.reads == 0:
+            raise _RefusedError(f"the {function} condition reads no column of '{table}'")
+        return table, condition
+
+    def filtered(self, text, table, function, extra=()):
+        """``text`` (one aggregate over ``table``) restricted by the active filters."""
+        filters = list(self.filters) + list(extra)
+        if not filters:
+            return text
+        for filter_table, _ in filters:
+            if filter_table.upper() != table.upper():
+                raise _RefusedError(
+                    f"the filter is on '{filter_table}' but {function} reads '{table}': "
+                    "applying it would follow relationships between tables, a later tier"
+                )
+        if function in _FILTER_COUNTS:
+            raise _RefusedError(
+                f"{function} under a filter is not translated: where no row matches, SQL "
+                "counts 0 while DAX returns BLANK"
+            )
+        where = " AND ".join(_wrap(condition, _AND) for _, condition in filters)
+        return f"{text} FILTER (WHERE {where})"
 
 
 #: DAX logic functions and the translator method for each.
@@ -1307,6 +1453,47 @@ _DATE_REFUSED = {
     "DATEDIFF counts boundaries or whole elapsed units is not specified, and engines "
     "differ (31 December to 1 January is 1 month or 0; apache/ossie#743)",
 }
+
+
+#: CALCULATE filter arguments that remove filters rather than narrow them.
+_FILTER_REMOVERS = frozenset({"ALL", "ALLEXCEPT", "ALLNOBLANKROW", "ALLSELECTED", "REMOVEFILTERS"})
+
+#: Counts are not translated under a filter: over no matching rows SQL gives 0, DAX BLANK.
+_FILTER_COUNTS = frozenset({"COUNTA", "DISTINCTCOUNTNOBLANK", "COUNT", "DISTINCTCOUNT", "COUNTX"})
+
+
+def _columns(node):
+    """Every ``Table[Column]`` reference in a DAX expression tree."""
+    if isinstance(node, Column):
+        return [node]
+    found = []
+    for child in _children(node):
+        found.extend(_columns(child))
+    return found
+
+
+def _children(node):
+    if isinstance(node, Call):
+        return node.args
+    if isinstance(node, Binary):
+        return (node.left, node.right)
+    if isinstance(node, Unary):
+        return (node.operand,)
+    if isinstance(node, Var):
+        return tuple(value for _, value in node.bindings) + (node.body,)
+    return ()
+
+
+def _single_table(node, function):
+    """The one table whose columns a filter condition reads."""
+    tables = {column.table.upper(): column.table for column in _columns(node)}
+    if not tables:
+        raise _RefusedError(f"the {function} condition reads no column")
+    if len(tables) > 1:
+        raise _RefusedError(
+            f"a {function} condition over columns of several tables is a later tier"
+        )
+    return next(iter(tables.values()))
 
 
 #: X-iterators: name -> (SQL aggregate template, kinds of row expression it accepts).

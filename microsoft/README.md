@@ -465,7 +465,12 @@ one more distinct value, so 1 is added when the column holds a NULL); `MEDIAN`,
 numeric column; the X-iterators `SUMX`, `AVERAGEX`, `MINX`, `MAXX`, `COUNTX`, `MEDIANX`,
 `PERCENTILEX.INC`, `STDEVX.*` and `VARX.*` over a table named directly, whose row
 expression reads only that table's columns (`SUMX('Sales', 'Sales'[Qty] * 'Sales'[Price])`
--> `SUM(Sales.Qty * Sales.Price)`); `DIVIDE(a, b)`; `+`, `-` and `*` between them (with DAX's BLANK rules:
+-> `SUM(Sales.Qty * Sales.Price)`); filtered aggregates, where the filter only narrows the
+context: `CALCULATE(e, KEEPFILTERS(condition))`, `CALCULATE(e, FILTER('T', condition))` and
+the X-iterators over `FILTER('T', condition)` restrict every aggregate in `e` to the rows the
+condition keeps (`CALCULATE(SUM('Sales'[Qty]), KEEPFILTERS('Sales'[Region] = "EU"))` ->
+`SUM(Sales.Qty) FILTER (WHERE COALESCE(Sales.Region, '') ILIKE 'EU')`), with the condition
+on the aggregated table's own columns; `DIVIDE(a, b)`; `+`, `-` and `*` between them (with DAX's BLANK rules:
 `BLANK + 5` is 5, `BLANK + BLANK` is BLANK); `/` by a non-zero literal; references to
 other measures; `VAR` / `RETURN`; and logic: `IF`, `SWITCH(TRUE, ...)`, `COALESCE`,
 `BLANK()`, `ISBLANK`, `TRUE` / `FALSE`, `AND` / `OR` / `NOT`, and comparisons (DAX
@@ -502,6 +507,17 @@ its declared `dataType`, so a column whose expression is of another kind than th
 column ranges over the whole table), a measure, a column of another table (`RELATED`),
 and `TRIM`, `SUBSTITUTE`, `EXACT`, `VALUE`, `FIND`, `SEARCH` and `CONTAINSSTRING` are
 refused with a reason.
+
+Text is compared as DAX compares it: without regard to case, and a BLANK as the empty
+string, so `'Sales'[Region] = "EU"` becomes `COALESCE(Sales.Region, '') ILIKE 'EU'` (only
+`=` and `<>` against a literal; a literal holding `%`, `_` or a backslash is refused, since
+ILIKE reads them as wildcards). Equivalences of a particular collation beyond case are not
+reproduced. A plain `CALCULATE` filter (`CALCULATE(e, 'Sales'[Region] = "EU")`) is refused:
+it replaces the outer filter on its column rather than narrowing it, which a per-row condition
+cannot express. So are `ALL` and `REMOVEFILTERS` (they remove filters), a filter on another
+table than the aggregate's (it would follow relationships), counts under a filter (over no
+matching row SQL counts 0 and DAX returns BLANK), and `CALCULATE` in a row context (context
+transition). A `VAR` defined outside a `CALCULATE` keeps its unfiltered value, as in DAX.
 
 Date functions, in measures and calculated columns, again only for a date that can never
 be BLANK (DAX reads BLANK as 30 December 1899, SQL gives NULL): `YEAR`, `QUARTER`,
